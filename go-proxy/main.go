@@ -16,12 +16,12 @@ import (
 )
 
 type ProxyServer struct {
-	db              *sql.DB
-	podName         string
-	namespace       string
-	serviceName     string
-	sglangURL       string
-	httpClient      *http.Client
+	db          *sql.DB
+	podName     string
+	namespace   string
+	serviceName string
+	sglangURL   string
+	httpClient  *http.Client
 }
 
 type RequestLog struct {
@@ -36,7 +36,7 @@ type RequestLog struct {
 
 func NewProxyServer() (*ProxyServer, error) {
 	// 获取 Pod 信息
-	podName := os. Getenv("POD_NAME")
+	podName := os.Getenv("POD_NAME")
 	namespace := os.Getenv("POD_NAMESPACE")
 	serviceName := os.Getenv("SERVICE_NAME")
 	sglangURL := os.Getenv("SGLANG_URL")
@@ -50,11 +50,11 @@ func NewProxyServer() (*ProxyServer, error) {
 	if serviceName == "" {
 		serviceName = "sglang-service"
 	}
-	
+
 	if podName == "" || namespace == "" || serviceName == "" {
 		return nil, fmt.Errorf("missing required environment variables")
 	}
-	
+
 	if sglangURL == "" {
 		sglangURL = "http://localhost:30000" // 默认 SGlang 端口
 	}
@@ -67,7 +67,7 @@ func NewProxyServer() (*ProxyServer, error) {
 
 	var db *sql.DB
 	var err error
-	
+
 	// 重试连接 MySQL
 	for i := 0; i < 30; i++ {
 		db, err = sql.Open("mysql", mysqlDSN)
@@ -80,7 +80,7 @@ func NewProxyServer() (*ProxyServer, error) {
 		log.Printf("Waiting for MySQL connection... (attempt %d/30)", i+1)
 		time.Sleep(2 * time.Second)
 	}
-	
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to MySQL: %v", err)
 	}
@@ -126,7 +126,7 @@ func initDatabase(db *sql.DB) error {
 		INDEX idx_service_time (service_name, request_time)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 	`
-	
+
 	_, err := db.Exec(createTableSQL)
 	return err
 }
@@ -136,7 +136,7 @@ func (ps *ProxyServer) logRequest(ctx context.Context, path, method string, stat
 		INSERT INTO request_logs (pod_name, namespace, service_name, request_time, path, method, status_code)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`
-	
+
 	_, err := ps.db.ExecContext(ctx, query,
 		ps.podName,
 		ps.namespace,
@@ -146,16 +146,16 @@ func (ps *ProxyServer) logRequest(ctx context.Context, path, method string, stat
 		method,
 		statusCode,
 	)
-	
+
 	return err
 }
 
 // 代理处理器 - 支持流式响应
 func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	
+
 	// 构建目标 URL
-	targetURL := ps.sglangURL + r.URL. Path
+	targetURL := ps.sglangURL + r.URL.Path
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
 	}
@@ -168,7 +168,7 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 创建新请求
-	proxyReq, err := http. NewRequestWithContext(r.Context(), r.Method, targetURL, bytes. NewReader(bodyBytes))
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		log.Printf("Error creating proxy request: %v", err)
 		http.Error(w, "Proxy error", http.StatusInternalServerError)
@@ -179,12 +179,12 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// 复制请求头
 	for key, values := range r.Header {
 		for _, value := range values {
-			proxyReq.Header. Add(key, value)
+			proxyReq.Header.Add(key, value)
 		}
 	}
 
 	// 发送请求
-	resp, err := ps.httpClient. Do(proxyReq)
+	resp, err := ps.httpClient.Do(proxyReq)
 	if err != nil {
 		log.Printf("Error proxying request to SGlang: %v", err)
 		http.Error(w, "SGlang service unavailable", http.StatusBadGateway)
@@ -201,14 +201,14 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 设置状态码
-	w. WriteHeader(resp.StatusCode)
+	w.WriteHeader(resp.StatusCode)
 
 	// 流式复制响应体 - 支持 SSE 等流式协议
 	if flusher, ok := w.(http.Flusher); ok {
 		// 支持流式传输
 		buffer := make([]byte, 4096)
 		for {
-			n, err := resp.Body. Read(buffer)
+			n, err := resp.Body.Read(buffer)
 			if n > 0 {
 				if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
 					log.Printf("Error writing response: %v", writeErr)
@@ -231,9 +231,9 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 记录请求日志
 	go ps.logRequest(context.Background(), r.URL.Path, r.Method, resp.StatusCode)
-	
+
 	log.Printf("Request proxied: %s %s -> Pod: %s, Status: %d, Duration: %v",
-		r.Method, r.URL.Path, ps. podName, resp.StatusCode, time.Since(startTime))
+		r.Method, r.URL.Path, ps.podName, resp.StatusCode, time.Since(startTime))
 }
 
 // 健康检查
@@ -261,7 +261,7 @@ func (ps *ProxyServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 		GROUP BY pod_name
 		ORDER BY request_count DESC
 	`
-	
+
 	rows, err := ps.db.Query(query, ps.serviceName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
@@ -277,7 +277,7 @@ func (ps *ProxyServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var stats []PodStats
-	for rows. Next() {
+	for rows.Next() {
 		var s PodStats
 		if err := rows.Scan(&s.PodName, &s.RequestCount, &s.FirstRequest, &s.LastRequest); err != nil {
 			log.Printf("Error scanning row: %v", err)
@@ -287,7 +287,7 @@ func (ps *ProxyServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w). Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"service":   ps.serviceName,
 		"namespace": ps.namespace,
 		"stats":     stats,
@@ -305,21 +305,21 @@ func (ps *ProxyServer) Close() error {
 func main() {
 	proxy, err := NewProxyServer()
 	if err != nil {
-		log. Fatalf("Failed to create proxy server: %v", err)
+		log.Fatalf("Failed to create proxy server: %v", err)
 	}
 	defer proxy.Close()
 
-	http. HandleFunc("/health", proxy.healthHandler)
+	http.HandleFunc("/health", proxy.healthHandler)
 	http.HandleFunc("/stats", proxy.statsHandler)
 	http.HandleFunc("/", proxy.proxyHandler) // 所有其他请求代理到 SGlang
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "9000"
 	}
 
 	log.Printf("Starting proxy server on port %s (Pod: %s)", port, proxy.podName)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log. Fatalf("Server failed: %v", err)
+		log.Fatalf("Server failed: %v", err)
 	}
 }

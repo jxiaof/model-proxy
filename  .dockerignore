@@ -5,3 +5,6 @@
 deploy/
 node_modules/
 **/*.test.go
+**/*.go.sum
+**/*.go.mod
+**/vendor/
