@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-proxy
+  labels:
+    app: sglang-proxy
+spec:
+  replicas: 3  # 多副本部署
+  selector:
+    matchLabels:
+      app: sglang-proxy
+  template:
+    metadata:
+      labels:
+        app: sglang-proxy
+    spec:
+      containers:
+      # 容器 A: SGlang 服务
+      - name: sglang
+        image: lmsysorg/sglang:latest
+        command:
+          - python3
+          - -m
+          - sglang.launch_server
+        args:
+          - --model-path=Qwen/Qwen2. 5-0.5B-Instruct
+          - --host=0.0.0.0
+          - --port=30000
+          - --log-level=warning
+        ports:
+        - containerPort: 30000
+          name: sglang
+        resources:
+          limits:
+            nvidia.com/gpu: 1  # 如果需要 GPU
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 30000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 30000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+      
+      # 容器 B: Go HTTP 代理服务
+      - name: proxy
+        image: your-registry/sglang-proxy:latest  # 替换为你的镜像
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata. namespace
+        - name: SERVICE_NAME
+          value: "sglang-proxy-service"
+        - name: SGLANG_URL
+          value: "http://localhost:30000"
+        - name: MYSQL_DSN
+          value: "root:your-secure-password@tcp(mysql-service:3306)/loadbalancer? parseTime=true"
+        - name: PORT
+          value: "8080"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10

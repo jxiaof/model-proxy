@@ -1,0 +1,7 @@
+.git
+.gitignore
+*.md
+*.log
+deploy/
+node_modules/
+**/*.test.go

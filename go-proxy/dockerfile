@@ -1,0 +1,24 @@
+# 构建阶段
+FROM golang:1.25-alpine3.18 AS builder
+
+WORKDIR /src
+# 安装证书以便后面可以从 builder 拷贝到 scratch 或 distroless
+RUN apk add --no-cache ca-certificates
+
+# 只先拷贝模块文件以利用缓存
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 拷贝源代码并构建
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" -o /app/proxy .
+
+# 运行阶段：使用 distroless 最小运行镜像（含 CA 证书）
+FROM gcr.io/distroless/static:nonroot
+# 如果你不能访问 distroless 镜像，也可改成 alpine 并安装 ca-certificates 与创建非 root 用户
+
+COPY --from=builder /app/proxy /usr/local/bin/proxy
+# distroless 非 root 默认用户已存在，直接暴露端口并运行
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/proxy"]
