@@ -91,3 +91,22 @@ spec:
             port: 8080
           initialDelaySeconds: 10
           periodSeconds: 10
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-proxy-service
+  labels:
+    app: sglang-proxy
+spec:
+  type: LoadBalancer  # 或使用 NodePort/ClusterIP
+  selector:
+    app: sglang-proxy
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP
+  sessionAffinity: None  # 确保负载均衡

@@ -11,7 +11,7 @@ RUN go mod download
 # 拷贝源代码并构建
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -ldflags="-s -w" -o /app/proxy .
+    go build -trimpath -ldflags="-s -w" -o /app/mock-llm .
 
 # 运行阶段：使用 alpine 轻量级镜像
 FROM alpine:3.21
@@ -21,19 +21,27 @@ RUN apk add --no-cache ca-certificates tzdata && \
     adduser -D -u 1000 -G appuser appuser
 
 WORKDIR /app
-COPY --from=builder --chown=appuser:appuser /app/proxy /app/proxy
+COPY --from=builder --chown=appuser:appuser /app/mock-llm /app/mock-llm
 
-# 暴露服务端口（与部署配置一致）
-EXPOSE 9000
+# 暴露服务端口（与 mock-llm 一致）
+EXPOSE 30000
 
 USER appuser
-ENTRYPOINT ["/app/proxy"]
+ENTRYPOINT ["/app/mock-llm"]
 
-# docker build -t model_proxy:latest .
-# docker run -d -p 9000:9000 model_proxy:latest
 
-# docker tag model_proxy:latest default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.0
-# docker push default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.0
+
+# 构建镜像
+# docker build -t mock-llm:latest -f mock-llm/dockerfile mock-llm/
+# docker build -t mock-llm:latest .
+# 本地测试
+# docker run -d -p 30000:30000 mock-llm:latest
+
+# 标记镜像
+# docker tag mock-llm:latest default-artifact.tencentcloudcr.com/dev/mock-llm:v1.0.0
+
+# 推送到镜像仓库
+# docker push default-artifact.tencentcloudcr.com/dev/mock-llm:v1.0.0
 
 
 

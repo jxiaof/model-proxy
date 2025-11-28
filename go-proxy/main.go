@@ -295,6 +295,96 @@ func (ps *ProxyServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Pod 负载信息
+func (ps *ProxyServer) podLoadHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	service := q.Get("service")
+	if service == "" {
+		service = ps.serviceName
+	}
+
+	var (
+		now      = time.Now()
+		startStr = q.Get("start")
+		endStr   = q.Get("end")
+		start    time.Time
+		end      time.Time
+		err      error
+	)
+
+	if startStr == "" {
+		start = now.Add(-1 * time.Hour)
+	} else {
+		start, err = time.Parse(time.RFC3339, startStr)
+		if err != nil {
+			http.Error(w, "invalid start (use RFC3339)", http.StatusBadRequest)
+			return
+		}
+	}
+	if endStr == "" {
+		end = now
+	} else {
+		end, err = time.Parse(time.RFC3339, endStr)
+		if err != nil {
+			http.Error(w, "invalid end (use RFC3339)", http.StatusBadRequest)
+			return
+		}
+	}
+	if !end.After(start) {
+		http.Error(w, "end must be after start", http.StatusBadRequest)
+		return
+	}
+
+	query := `
+		SELECT 
+			pod_name,
+			COUNT(*) as request_count,
+			AVG(status_code) as avg_status_code,
+			MIN(request_time) as first_request,
+			MAX(request_time) as last_request
+		FROM request_logs
+		WHERE service_name = ? AND request_time BETWEEN ? AND ?
+		GROUP BY pod_name
+		ORDER BY request_count DESC
+	`
+
+	rows, err := ps.db.Query(query, service, start, end)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type PodLoad struct {
+		PodName        string    `json:"pod_name"`
+		RequestCount   int       `json:"request_count"`
+		AvgStatusCode  float64   `json:"avg_status_code"`
+		FirstRequestAt time.Time `json:"first_request"`
+		LastRequestAt  time.Time `json:"last_request"`
+	}
+	var loads []PodLoad
+	for rows.Next() {
+		var pl PodLoad
+		if err := rows.Scan(&pl.PodName, &pl.RequestCount, &pl.AvgStatusCode, &pl.FirstRequestAt, &pl.LastRequestAt); err != nil {
+			log.Printf("Error scanning pod load row: %v", err)
+			continue
+		}
+		loads = append(loads, pl)
+	}
+
+	resp := map[string]interface{}{
+		"service":   service,
+		"namespace": ps.namespace,
+		"start":     start.Format(time.RFC3339),
+		"end":       end.Format(time.RFC3339),
+		"pods":      loads,
+		"timestamp": time.Now().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
 func (ps *ProxyServer) Close() error {
 	if ps.db != nil {
 		return ps.db.Close()
@@ -311,6 +401,7 @@ func main() {
 
 	http.HandleFunc("/health", proxy.healthHandler)
 	http.HandleFunc("/stats", proxy.statsHandler)
+	http.HandleFunc("/pod-load", proxy.podLoadHandler)
 	http.HandleFunc("/", proxy.proxyHandler) // 所有其他请求代理到 SGlang
 
 	port := os.Getenv("PORT")
