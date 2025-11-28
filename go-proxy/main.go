@@ -150,8 +150,33 @@ func (ps *ProxyServer) logRequest(ctx context.Context, path, method string, stat
 	return err
 }
 
-// 代理处理器 - 支持流式响应
+// 通用 CORS 处理器（用于全局处理）
+func enableCORS(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		origin = "*"
+	}
+
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
+	w.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Tenant-ID, Accept-Language, X-Request-ID, X-Internal-Timestamp, X-Internal-Signature, X-Internal-Nonce, X-Internal-Call")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Access-Control-Max-Age", "86400")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+	return false
+}
+
+// 代理处理器 - 支持流式响应和 CORS
 func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
+	// 处理 CORS
+	if enableCORS(w, r) {
+		return
+	}
+
 	startTime := time.Now()
 
 	// 构建目标 URL
@@ -193,8 +218,13 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// 复制响应头
+	// 复制响应头（排除可能冲突的 CORS 头）
 	for key, values := range resp.Header {
+		if key == "Access-Control-Allow-Origin" ||
+			key == "Access-Control-Allow-Methods" ||
+			key == "Access-Control-Allow-Headers" {
+			continue // 跳过后端的 CORS 头，使用代理设置的
+		}
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
@@ -205,7 +235,6 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 流式复制响应体 - 支持 SSE 等流式协议
 	if flusher, ok := w.(http.Flusher); ok {
-		// 支持流式传输
 		buffer := make([]byte, 4096)
 		for {
 			n, err := resp.Body.Read(buffer)
@@ -238,6 +267,9 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 // 健康检查
 func (ps *ProxyServer) healthHandler(w http.ResponseWriter, r *http.Request) {
+	if enableCORS(w, r) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":    "healthy",
@@ -248,8 +280,42 @@ func (ps *ProxyServer) healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// 统一响应结构
+type Response struct {
+	Code    int         `json:"code"`
+	Msg     string      `json:"msg"`
+	Data    interface{} `json:"data"`
+	Details string      `json:"details,omitempty"`
+}
+
+// 成功响应
+func successResponse(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(Response{
+		Code: 0,
+		Msg:  "success",
+		Data: data,
+	})
+}
+
+// 错误响应
+func errorResponse(w http.ResponseWriter, code int, msg string, detail string, httpStatus int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(httpStatus)
+	json.NewEncoder(w).Encode(Response{
+		Code:    code,
+		Msg:     msg,
+		Data:    nil,
+		Details: detail,
+	})
+}
+
 // 统计信息
 func (ps *ProxyServer) statsHandler(w http.ResponseWriter, r *http.Request) {
+	if enableCORS(w, r) {
+		return
+	}
+
 	query := `
 		SELECT 
 			pod_name,
@@ -264,7 +330,7 @@ func (ps *ProxyServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := ps.db.Query(query, ps.serviceName)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+		errorResponse(w, 500, "database error", err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -286,8 +352,12 @@ func (ps *ProxyServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 		stats = append(stats, s)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := rows.Err(); err != nil {
+		errorResponse(w, 500, "database scan error", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	successResponse(w, map[string]interface{}{
 		"service":   ps.serviceName,
 		"namespace": ps.namespace,
 		"stats":     stats,
@@ -297,6 +367,10 @@ func (ps *ProxyServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 
 // Pod 负载信息
 func (ps *ProxyServer) podLoadHandler(w http.ResponseWriter, r *http.Request) {
+	if enableCORS(w, r) {
+		return
+	}
+
 	q := r.URL.Query()
 	service := q.Get("service")
 	if service == "" {
@@ -317,7 +391,7 @@ func (ps *ProxyServer) podLoadHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		start, err = time.Parse(time.RFC3339, startStr)
 		if err != nil {
-			http.Error(w, "invalid start (use RFC3339)", http.StatusBadRequest)
+			errorResponse(w, 400, "invalid parameter", "invalid start (use RFC3339 format, e.g. 2025-01-01T00:00:00Z)", http.StatusBadRequest)
 			return
 		}
 	}
@@ -326,12 +400,12 @@ func (ps *ProxyServer) podLoadHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		end, err = time.Parse(time.RFC3339, endStr)
 		if err != nil {
-			http.Error(w, "invalid end (use RFC3339)", http.StatusBadRequest)
+			errorResponse(w, 400, "invalid parameter", "invalid end (use RFC3339 format, e.g. 2025-01-01T23:59:59Z)", http.StatusBadRequest)
 			return
 		}
 	}
 	if !end.After(start) {
-		http.Error(w, "end must be after start", http.StatusBadRequest)
+		errorResponse(w, 400, "invalid parameter", "end must be after start", http.StatusBadRequest)
 		return
 	}
 
@@ -350,7 +424,7 @@ func (ps *ProxyServer) podLoadHandler(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := ps.db.Query(query, service, start, end)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+		errorResponse(w, 500, "database error", err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -372,17 +446,19 @@ func (ps *ProxyServer) podLoadHandler(w http.ResponseWriter, r *http.Request) {
 		loads = append(loads, pl)
 	}
 
-	resp := map[string]interface{}{
+	if err := rows.Err(); err != nil {
+		errorResponse(w, 500, "database scan error", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	successResponse(w, map[string]interface{}{
 		"service":   service,
 		"namespace": ps.namespace,
 		"start":     start.Format(time.RFC3339),
 		"end":       end.Format(time.RFC3339),
 		"pods":      loads,
 		"timestamp": time.Now().Format(time.RFC3339),
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	})
 }
 
 func (ps *ProxyServer) Close() error {
@@ -399,18 +475,24 @@ func main() {
 	}
 	defer proxy.Close()
 
-	http.HandleFunc("/health", proxy.healthHandler)
-	http.HandleFunc("/stats", proxy.statsHandler)
-	http.HandleFunc("/pod-load", proxy.podLoadHandler)
-	http.HandleFunc("/", proxy.proxyHandler) // 所有其他请求代理到 SGlang
+	// 使用 ServeMux 确保路由精确匹配
+	mux := http.NewServeMux()
+
+	// 精确路由优先注册
+	mux.HandleFunc("/health", proxy.healthHandler)
+	mux.HandleFunc("/stats", proxy.statsHandler)
+	mux.HandleFunc("/pod-load", proxy.podLoadHandler)
+
+	// 通配路由最后注册
+	mux.HandleFunc("/", proxy.proxyHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "9000"
 	}
 
-	log.Printf("Starting proxy server on port %s (Pod: %s)", port, proxy.podName)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	log.Printf("Starting proxy server on port %s (Pod: %s) with CORS enabled", port, proxy.podName)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
