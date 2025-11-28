@@ -29,11 +29,11 @@ EXPOSE 9000
 USER appuser
 ENTRYPOINT ["/app/proxy"]
 
-# docker build -t model_proxy:latest .
+# docker build --platform linux/amd64 -t model_proxy:latest .
 # docker run -d -p 9000:9000 model_proxy:latest
 
-# docker tag model_proxy:latest default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.0
-# docker push default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.0
+# docker tag model_proxy:latest default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.2
+# docker push default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.2
 
 
 

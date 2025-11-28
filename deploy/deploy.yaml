@@ -5,7 +5,7 @@ metadata:
   labels:
     app: sglang-proxy
 spec:
-  replicas: 3  # 多副本部署
+  replicas: 1
   selector:
     matchLabels:
       app: sglang-proxy
@@ -14,46 +14,76 @@ spec:
       labels:
         app: sglang-proxy
     spec:
+      nodeSelector:
+        kubernetes.io/hostname: sz-inf-5090-06
+      imagePullSecrets:
+      - name: tencent-registry-secret
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: nfs-model-pvc
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
       containers:
       # 容器 A: SGlang 服务
       - name: sglang
-        image: lmsysorg/sglang:latest
+        image: default-artifact.tencentcloudcr.com/prod/lmsysorg/sglang:v25.11.28
         command:
           - python3
           - -m
           - sglang.launch_server
         args:
-          - --model-path=Qwen/Qwen2. 5-0.5B-Instruct
+          - --model-path=/mnt/data/models/Qwen3-8B
           - --host=0.0.0.0
           - --port=30000
+          - --tokenizer-path=/mnt/data/models/Qwen3-8B
           - --log-level=warning
         ports:
         - containerPort: 30000
           name: sglang
+        volumeMounts:
+        - name: model-storage
+          mountPath: /mnt/data/
+        - name: shm
+          mountPath: /dev/shm
         resources:
           limits:
-            nvidia.com/gpu: 1  # 如果需要 GPU
+            nvidia.com/gpu: 1
           requests:
-            memory: "4Gi"
-            cpu: "2"
-        readinessProbe:
+            memory: "16Gi"
+            cpu: "8"
+        startupProbe:
           httpGet:
             path: /health
             port: 30000
           initialDelaySeconds: 30
           periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 30000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
         livenessProbe:
           httpGet:
             path: /health
             port: 30000
-          initialDelaySeconds: 60
+          initialDelaySeconds: 10
           periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
       
       # 容器 B: Go HTTP 代理服务
       - name: proxy
-        image: your-registry/sglang-proxy:latest  # 替换为你的镜像
+        image: default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.2
         ports:
-        - containerPort: 8080
+        - containerPort: 9000
           name: http
         env:
         - name: POD_NAME
@@ -63,15 +93,15 @@ spec:
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:
-              fieldPath: metadata. namespace
+              fieldPath: metadata.namespace
         - name: SERVICE_NAME
           value: "sglang-proxy-service"
         - name: SGLANG_URL
           value: "http://localhost:30000"
         - name: MYSQL_DSN
-          value: "root:your-secure-password@tcp(mysql-service:3306)/loadbalancer? parseTime=true"
+          value: "root:Admin@798!@tcp(gz-cdb-ihelunwl.sql.tencentcdb.com:28531)/tycloud?charset=utf8mb4&parseTime=True&loc=Local"
         - name: PORT
-          value: "8080"
+          value: "9000"
         resources:
           requests:
             memory: "256Mi"
@@ -82,13 +112,13 @@ spec:
         readinessProbe:
           httpGet:
             path: /health
-            port: 8080
+            port: 9000
           initialDelaySeconds: 5
           periodSeconds: 5
         livenessProbe:
           httpGet:
             path: /health
-            port: 8080
+            port: 9000
           initialDelaySeconds: 10
           periodSeconds: 10
 
@@ -101,12 +131,12 @@ metadata:
   labels:
     app: sglang-proxy
 spec:
-  type: LoadBalancer  # 或使用 NodePort/ClusterIP
+  type: LoadBalancer
   selector:
     app: sglang-proxy
   ports:
   - name: http
     port: 80
-    targetPort: 8080
+    targetPort: 9000
     protocol: TCP
-  sessionAffinity: None  # 确保负载均衡
+  sessionAffinity: None

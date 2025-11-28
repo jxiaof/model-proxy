@@ -32,16 +32,16 @@ ENTRYPOINT ["/app/mock-llm"]
 
 
 # 构建镜像
-# docker build -t mock-llm:latest -f mock-llm/dockerfile mock-llm/
+# docker build --platform linux/amd64 -t mock-llm:latest -f mock-llm/dockerfile mock-llm/
 # docker build -t mock-llm:latest .
 # 本地测试
 # docker run -d -p 30000:30000 mock-llm:latest
 
 # 标记镜像
-# docker tag mock-llm:latest default-artifact.tencentcloudcr.com/dev/mock-llm:v1.0.0
-
+# docker tag mock-llm:latest default-artifact.tencentcloudcr.com/dev/mock-llm:v1.0.1
+    
 # 推送到镜像仓库
-# docker push default-artifact.tencentcloudcr.com/dev/mock-llm:v1.0.0
+# docker push default-artifact.tencentcloudcr.com/dev/mock-llm:v1.0.1
 
 
 

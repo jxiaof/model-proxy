@@ -40,3 +40,25 @@ done
 
 wait
 curl -s "$SERVICE_URL/stats" | jq .
+
+
+
+curl -X POST "http://localhost:30000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen3-8B","messages":[{"role":"user","content":"你好，请用中文回复"}],"max_tokens":50}'
+
+
+
+  curl -X POST "http://localhost:30000/generate" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello, how are you?","sampling_params":{"temperature":0.7,"max_new_tokens":50}}'
+
+
+
+  curl -X POST "http://10.10.0.14:30797/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen3-8B","messages":[{"role":"user","content":"你好"}],"max_tokens":30}'
+
+
+
+  curl -s "http://10.10.0.14:30797/analytics?service=sglang-proxy-service&start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z" | jq .
