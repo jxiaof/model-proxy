@@ -32,8 +32,8 @@ ENTRYPOINT ["/app/proxy"]
 # docker build --platform linux/amd64 -t model_proxy:latest .
 # docker run -d -p 9000:9000 model_proxy:latest
 
-# docker tag model_proxy:latest default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.5
-# docker push default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.5
+# docker tag model_proxy:latest default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.7
+# docker push default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.7
 
 
 
@@ -43,3 +43,12 @@ ENTRYPOINT ["/app/proxy"]
 #   --docker-password='RSw2KCGXdOh00S43KozQTwEr9Kp2BrJu' \
 #   --docker-email='your-email@example.com' \
 #   -n default
+
+# curl -X POST "http://localhost:9000/v1/chat/completions" \
+#   -H "Content-Type: application/json" \
+#   -d '{
+#     "model": "Qwen3-8B",
+#     "messages": [{"role": "user", "content": "请解释量子力学"}],
+#     "thinking": true,
+#     "max_tokens": 2000
+#   }'

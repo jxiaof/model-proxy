@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -32,6 +33,8 @@ type RequestLog struct {
 	Path        string    `json:"path"`
 	Method      string    `json:"method"`
 	StatusCode  int       `json:"status_code"`
+	IsThinkMode bool      `json:"is_think_mode"`
+	Duration    int64     `json:"duration_ms"`
 }
 
 func NewProxyServer() (*ProxyServer, error) {
@@ -90,14 +93,16 @@ func NewProxyServer() (*ProxyServer, error) {
 		return nil, fmt.Errorf("failed to init database: %v", err)
 	}
 
-	// 配置 HTTP 客户端支持长连接
+	// 配置 HTTP 客户端支持长连接和 Think 模式的超长等待
 	httpClient := &http.Client{
-		Timeout: 300 * time.Second, // 5分钟超时，适合长连接
+		Timeout: 600 * time.Second, // 10分钟超时，适合 Think 模式
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-			DisableKeepAlives:   false, // 启用 Keep-Alive
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   100,
+			IdleConnTimeout:       120 * time.Second,
+			DisableKeepAlives:     false,
+			ResponseHeaderTimeout: 300 * time.Second, // Think 模式可能需要更长的首字节等待
+			ExpectContinueTimeout: 10 * time.Second,
 		},
 	}
 
@@ -113,29 +118,32 @@ func NewProxyServer() (*ProxyServer, error) {
 
 func initDatabase(db *sql.DB) error {
 	createTableSQL := `
-	CREATE TABLE IF NOT EXISTS request_logs (
-		id BIGINT AUTO_INCREMENT PRIMARY KEY,
-		pod_name VARCHAR(255) NOT NULL,
-		namespace VARCHAR(255) NOT NULL,
-		service_name VARCHAR(255) NOT NULL,
-		request_time DATETIME NOT NULL,
-		path VARCHAR(500),
-		method VARCHAR(10),
-		status_code INT,
-		INDEX idx_pod_time (pod_name, request_time),
-		INDEX idx_service_time (service_name, request_time)
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-	`
+    CREATE TABLE IF NOT EXISTS request_logs (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        pod_name VARCHAR(255) NOT NULL,
+        namespace VARCHAR(255) NOT NULL,
+        service_name VARCHAR(255) NOT NULL,
+        request_time DATETIME NOT NULL,
+        path VARCHAR(500),
+        method VARCHAR(10),
+        status_code INT,
+        is_think_mode TINYINT(1) DEFAULT 0,
+        duration_ms BIGINT DEFAULT 0,
+        INDEX idx_pod_time (pod_name, request_time),
+        INDEX idx_service_time (service_name, request_time),
+        INDEX idx_think_mode (is_think_mode, request_time)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `
 
 	_, err := db.Exec(createTableSQL)
 	return err
 }
 
-func (ps *ProxyServer) logRequest(ctx context.Context, path, method string, statusCode int) error {
+func (ps *ProxyServer) logRequest(ctx context.Context, path, method string, statusCode int, isThinkMode bool, durationMs int64) error {
 	query := `
-		INSERT INTO request_logs (pod_name, namespace, service_name, request_time, path, method, status_code)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`
+        INSERT INTO request_logs (pod_name, namespace, service_name, request_time, path, method, status_code, is_think_mode, duration_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `
 
 	_, err := ps.db.ExecContext(ctx, query,
 		ps.podName,
@@ -145,12 +153,66 @@ func (ps *ProxyServer) logRequest(ctx context.Context, path, method string, stat
 		path,
 		method,
 		statusCode,
+		isThinkMode,
+		durationMs,
 	)
 
 	return err
 }
 
-// 通用 CORS 处理器（用于全局处理）
+// 检测是否为 Think 模式请求
+func isThinkModeRequest(body []byte) bool {
+	// 检测请求体中是否包含 Think 模式相关参数
+	var reqBody map[string]interface{}
+	if err := json.Unmarshal(body, &reqBody); err != nil {
+		return false
+	}
+
+	// 检查常见的 Think 模式标志
+	// 1. thinking 参数
+	if thinking, ok := reqBody["thinking"].(bool); ok && thinking {
+		return true
+	}
+
+	// 2. enable_thinking 参数
+	if enableThinking, ok := reqBody["enable_thinking"].(bool); ok && enableThinking {
+		return true
+	}
+
+	// 3. 检查 messages 中是否有 think 指令
+	if messages, ok := reqBody["messages"].([]interface{}); ok {
+		for _, msg := range messages {
+			if m, ok := msg.(map[string]interface{}); ok {
+				if content, ok := m["content"].(string); ok {
+					if strings.Contains(strings.ToLower(content), "/think") ||
+						strings.Contains(strings.ToLower(content), "think step by step") ||
+						strings.Contains(strings.ToLower(content), "let's think") {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	// 4. 检查 sampling_params 中的 thinking 参数
+	if samplingParams, ok := reqBody["sampling_params"].(map[string]interface{}); ok {
+		if thinking, ok := samplingParams["thinking"].(bool); ok && thinking {
+			return true
+		}
+	}
+
+	return false
+}
+
+// 检测响应是否包含 Think 内容
+func containsThinkContent(data []byte) bool {
+	return bytes.Contains(data, []byte("<think>")) ||
+		bytes.Contains(data, []byte("</think>")) ||
+		bytes.Contains(data, []byte(`"thinking"`)) ||
+		bytes.Contains(data, []byte(`"reasoning_content"`))
+}
+
+// 通用 CORS 处理器
 func enableCORS(w http.ResponseWriter, r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
@@ -170,7 +232,7 @@ func enableCORS(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-// 代理处理器 - 支持流式响应和 CORS
+// 代理处理器 - 支持流式响应、CORS 和 Think 模式
 func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// 处理 CORS
 	if enableCORS(w, r) {
@@ -192,12 +254,27 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		r.Body.Close()
 	}
 
-	// 创建新请求
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(bodyBytes))
+	// 检测是否为 Think 模式
+	isThinkMode := isThinkModeRequest(bodyBytes)
+	if isThinkMode {
+		log.Printf("Think mode detected for request: %s %s", r.Method, r.URL.Path)
+	}
+
+	// 创建新请求 - Think 模式使用更长的超时上下文
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if isThinkMode {
+		ctx, cancel = context.WithTimeout(r.Context(), 600*time.Second) // 10分钟
+	} else {
+		ctx, cancel = context.WithTimeout(r.Context(), 300*time.Second) // 5分钟
+	}
+	defer cancel()
+
+	proxyReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		log.Printf("Error creating proxy request: %v", err)
 		http.Error(w, "Proxy error", http.StatusInternalServerError)
-		ps.logRequest(context.Background(), r.URL.Path, r.Method, http.StatusInternalServerError)
+		go ps.logRequest(context.Background(), r.URL.Path, r.Method, http.StatusInternalServerError, isThinkMode, time.Since(startTime).Milliseconds())
 		return
 	}
 
@@ -213,43 +290,62 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("Error proxying request to SGlang: %v", err)
 		http.Error(w, "SGlang service unavailable", http.StatusBadGateway)
-		ps.logRequest(context.Background(), r.URL.Path, r.Method, http.StatusBadGateway)
+		go ps.logRequest(context.Background(), r.URL.Path, r.Method, http.StatusBadGateway, isThinkMode, time.Since(startTime).Milliseconds())
 		return
 	}
 	defer resp.Body.Close()
+
+	// 检测响应是否为流式（SSE）
+	isStreamResponse := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") ||
+		strings.Contains(resp.Header.Get("Content-Type"), "application/x-ndjson") ||
+		resp.Header.Get("Transfer-Encoding") == "chunked"
 
 	// 复制响应头（排除可能冲突的 CORS 头）
 	for key, values := range resp.Header {
 		if key == "Access-Control-Allow-Origin" ||
 			key == "Access-Control-Allow-Methods" ||
 			key == "Access-Control-Allow-Headers" {
-			continue // 跳过后端的 CORS 头，使用代理设置的
+			continue
 		}
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
 
+	// 对于流式响应，确保禁用缓冲
+	if isStreamResponse {
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+	}
+
 	// 设置状态码
 	w.WriteHeader(resp.StatusCode)
 
-	// 流式复制响应体 - 支持 SSE 等流式协议
+	// 流式复制响应体 - 支持 SSE 和 Think 模式
+	var detectedThinkInResponse bool
 	if flusher, ok := w.(http.Flusher); ok {
 		buffer := make([]byte, 4096)
 		for {
-			n, err := resp.Body.Read(buffer)
+			n, readErr := resp.Body.Read(buffer)
 			if n > 0 {
+				// 检测响应中是否包含 Think 内容
+				if !detectedThinkInResponse && containsThinkContent(buffer[:n]) {
+					detectedThinkInResponse = true
+					isThinkMode = true // 更新为 Think 模式
+				}
+
 				if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
 					log.Printf("Error writing response: %v", writeErr)
 					break
 				}
 				flusher.Flush() // 立即刷新数据到客户端
 			}
-			if err == io.EOF {
+			if readErr == io.EOF {
 				break
 			}
-			if err != nil {
-				log.Printf("Error reading response body: %v", err)
+			if readErr != nil {
+				log.Printf("Error reading response body: %v", readErr)
 				break
 			}
 		}
@@ -258,11 +354,17 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		io.Copy(w, resp.Body)
 	}
 
-	// 记录请求日志
-	go ps.logRequest(context.Background(), r.URL.Path, r.Method, resp.StatusCode)
+	duration := time.Since(startTime)
 
-	log.Printf("Request proxied: %s %s -> Pod: %s, Status: %d, Duration: %v",
-		r.Method, r.URL.Path, ps.podName, resp.StatusCode, time.Since(startTime))
+	// 记录请求日志
+	go ps.logRequest(context.Background(), r.URL.Path, r.Method, resp.StatusCode, isThinkMode, duration.Milliseconds())
+
+	modeStr := ""
+	if isThinkMode {
+		modeStr = " [THINK]"
+	}
+	log.Printf("Request proxied%s: %s %s -> Pod: %s, Status: %d, Duration: %v",
+		modeStr, r.Method, r.URL.Path, ps.podName, resp.StatusCode, duration)
 }
 
 // 健康检查
@@ -276,6 +378,7 @@ func (ps *ProxyServer) healthHandler(w http.ResponseWriter, r *http.Request) {
 		"pod":       ps.podName,
 		"namespace": ps.namespace,
 		"service":   ps.serviceName,
+		"features":  []string{"streaming", "think-mode", "cors"},
 		"timestamp": time.Now().Format(time.RFC3339),
 	})
 }
@@ -317,16 +420,18 @@ func (ps *ProxyServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := `
-		SELECT 
-			pod_name,
-			COUNT(*) as request_count,
-			MIN(request_time) as first_request,
-			MAX(request_time) as last_request
-		FROM request_logs
-		WHERE service_name = ? 
-		GROUP BY pod_name
-		ORDER BY request_count DESC
-	`
+        SELECT 
+            pod_name,
+            COUNT(*) as request_count,
+            SUM(CASE WHEN is_think_mode = 1 THEN 1 ELSE 0 END) as think_mode_count,
+            AVG(duration_ms) as avg_duration_ms,
+            MIN(request_time) as first_request,
+            MAX(request_time) as last_request
+        FROM request_logs
+        WHERE service_name = ? 
+        GROUP BY pod_name
+        ORDER BY request_count DESC
+    `
 
 	rows, err := ps.db.Query(query, ps.serviceName)
 	if err != nil {
@@ -336,16 +441,18 @@ func (ps *ProxyServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type PodStats struct {
-		PodName      string    `json:"pod_name"`
-		RequestCount int       `json:"request_count"`
-		FirstRequest time.Time `json:"first_request"`
-		LastRequest  time.Time `json:"last_request"`
+		PodName        string    `json:"pod_name"`
+		RequestCount   int       `json:"request_count"`
+		ThinkModeCount int       `json:"think_mode_count"`
+		AvgDurationMs  float64   `json:"avg_duration_ms"`
+		FirstRequest   time.Time `json:"first_request"`
+		LastRequest    time.Time `json:"last_request"`
 	}
 
 	var stats []PodStats
 	for rows.Next() {
 		var s PodStats
-		if err := rows.Scan(&s.PodName, &s.RequestCount, &s.FirstRequest, &s.LastRequest); err != nil {
+		if err := rows.Scan(&s.PodName, &s.RequestCount, &s.ThinkModeCount, &s.AvgDurationMs, &s.FirstRequest, &s.LastRequest); err != nil {
 			log.Printf("Error scanning row: %v", err)
 			continue
 		}
@@ -410,17 +517,19 @@ func (ps *ProxyServer) podLoadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := `
-		SELECT 
-			pod_name,
-			COUNT(*) as request_count,
-			AVG(status_code) as avg_status_code,
-			MIN(request_time) as first_request,
-			MAX(request_time) as last_request
-		FROM request_logs
-		WHERE service_name = ? AND request_time BETWEEN ? AND ?
-		GROUP BY pod_name
-		ORDER BY request_count DESC
-	`
+        SELECT 
+            pod_name,
+            COUNT(*) as request_count,
+            SUM(CASE WHEN is_think_mode = 1 THEN 1 ELSE 0 END) as think_mode_count,
+            AVG(status_code) as avg_status_code,
+            AVG(duration_ms) as avg_duration_ms,
+            MIN(request_time) as first_request,
+            MAX(request_time) as last_request
+        FROM request_logs
+        WHERE service_name = ? AND request_time BETWEEN ? AND ?
+        GROUP BY pod_name
+        ORDER BY request_count DESC
+    `
 
 	rows, err := ps.db.Query(query, service, start, end)
 	if err != nil {
@@ -432,14 +541,16 @@ func (ps *ProxyServer) podLoadHandler(w http.ResponseWriter, r *http.Request) {
 	type PodLoad struct {
 		PodName        string    `json:"pod_name"`
 		RequestCount   int       `json:"request_count"`
+		ThinkModeCount int       `json:"think_mode_count"`
 		AvgStatusCode  float64   `json:"avg_status_code"`
+		AvgDurationMs  float64   `json:"avg_duration_ms"`
 		FirstRequestAt time.Time `json:"first_request"`
 		LastRequestAt  time.Time `json:"last_request"`
 	}
 	var loads []PodLoad
 	for rows.Next() {
 		var pl PodLoad
-		if err := rows.Scan(&pl.PodName, &pl.RequestCount, &pl.AvgStatusCode, &pl.FirstRequestAt, &pl.LastRequestAt); err != nil {
+		if err := rows.Scan(&pl.PodName, &pl.RequestCount, &pl.ThinkModeCount, &pl.AvgStatusCode, &pl.AvgDurationMs, &pl.FirstRequestAt, &pl.LastRequestAt); err != nil {
 			log.Printf("Error scanning pod load row: %v", err)
 			continue
 		}
@@ -458,6 +569,63 @@ func (ps *ProxyServer) podLoadHandler(w http.ResponseWriter, r *http.Request) {
 		"end":       end.Format(time.RFC3339),
 		"pods":      loads,
 		"timestamp": time.Now().Format(time.RFC3339),
+	})
+}
+
+// Think 模式统计 API
+func (ps *ProxyServer) thinkStatsHandler(w http.ResponseWriter, r *http.Request) {
+	if enableCORS(w, r) {
+		return
+	}
+
+	q := r.URL.Query()
+	service := q.Get("service")
+	if service == "" {
+		service = ps.serviceName
+	}
+
+	query := `
+        SELECT 
+            is_think_mode,
+            COUNT(*) as request_count,
+            AVG(duration_ms) as avg_duration_ms,
+            MAX(duration_ms) as max_duration_ms,
+            MIN(duration_ms) as min_duration_ms
+        FROM request_logs
+        WHERE service_name = ? AND request_time >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        GROUP BY is_think_mode
+    `
+
+	rows, err := ps.db.Query(query, service)
+	if err != nil {
+		errorResponse(w, 500, "database error", err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type ModeStats struct {
+		IsThinkMode   bool    `json:"is_think_mode"`
+		RequestCount  int     `json:"request_count"`
+		AvgDurationMs float64 `json:"avg_duration_ms"`
+		MaxDurationMs int64   `json:"max_duration_ms"`
+		MinDurationMs int64   `json:"min_duration_ms"`
+	}
+
+	var modeStats []ModeStats
+	for rows.Next() {
+		var ms ModeStats
+		if err := rows.Scan(&ms.IsThinkMode, &ms.RequestCount, &ms.AvgDurationMs, &ms.MaxDurationMs, &ms.MinDurationMs); err != nil {
+			log.Printf("Error scanning think stats row: %v", err)
+			continue
+		}
+		modeStats = append(modeStats, ms)
+	}
+
+	successResponse(w, map[string]interface{}{
+		"service":    service,
+		"namespace":  ps.namespace,
+		"mode_stats": modeStats,
+		"timestamp":  time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -482,6 +650,7 @@ func main() {
 	mux.HandleFunc("/health", proxy.healthHandler)
 	mux.HandleFunc("/stats", proxy.statsHandler)
 	mux.HandleFunc("/pod-load", proxy.podLoadHandler)
+	mux.HandleFunc("/think-stats", proxy.thinkStatsHandler)
 
 	// 通配路由最后注册
 	mux.HandleFunc("/", proxy.proxyHandler)
@@ -491,7 +660,7 @@ func main() {
 		port = "9000"
 	}
 
-	log.Printf("Starting proxy server on port %s (Pod: %s) with CORS enabled", port, proxy.podName)
+	log.Printf("Starting proxy server on port %s (Pod: %s) with CORS and Think mode enabled", port, proxy.podName)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}

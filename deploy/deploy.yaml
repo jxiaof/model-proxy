@@ -5,7 +5,7 @@ metadata:
   labels:
     app: sglang-proxy
 spec:
-  replicas: 1
+  replicas: 6
   selector:
     matchLabels:
       app: sglang-proxy
@@ -14,8 +14,31 @@ spec:
       labels:
         app: sglang-proxy
     spec:
+      # affinity:
+      #   # Pod 反亲和性 - 尽量分散到不同节点
+      #   podAntiAffinity:
+      #     preferredDuringSchedulingIgnoredDuringExecution:
+      #     - weight: 100
+      #       podAffinityTerm:
+      #         labelSelector:
+      #           matchLabels:
+      #             app: sglang-proxy
+      #         topologyKey: kubernetes.io/hostname
+      #   # 节点亲和性 - 只调度到有 GPU 的节点
+      #   nodeAffinity:
+      #     requiredDuringSchedulingIgnoredDuringExecution:
+      #       nodeSelectorTerms:
+      #       - matchExpressions:
+      #         - key: kubernetes.io/hostname
+      #           operator: In
+      #           values:
+      #           - sz-inf-5090-06
+      #           - sz-inf-5090-09
+      #           - sz-inf-5090-11
+      #           - sz-inf-5090-05  # GPU 有问题，暂时排除
       nodeSelector:
-        kubernetes.io/hostname: sz-inf-5090-06
+        nvidia.com/gpu.present: "true"
+        # sz-inf-5090-11
       imagePullSecrets:
       - name: tencent-registry-secret
       volumes:
@@ -81,7 +104,7 @@ spec:
       
       # 容器 B: Go HTTP 代理服务
       - name: proxy
-        image: default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.2
+        image: default-artifact.tencentcloudcr.com/dev/model_proxy:v1.0.6
         ports:
         - containerPort: 9000
           name: http
@@ -121,22 +144,21 @@ spec:
             port: 9000
           initialDelaySeconds: 10
           periodSeconds: 10
+# ---
 
----
-
-apiVersion: v1
-kind: Service
-metadata:
-  name: sglang-proxy-service
-  labels:
-    app: sglang-proxy
-spec:
-  type: LoadBalancer
-  selector:
-    app: sglang-proxy
-  ports:
-  - name: http
-    port: 80
-    targetPort: 9000
-    protocol: TCP
-  sessionAffinity: None
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: sglang-proxy-service
+#   labels:
+#     app: sglang-proxy
+# spec:
+#   type: LoadBalancer
+#   selector:
+#     app: sglang-proxy
+#   ports:
+#   - name: http
+#     port: 80
+#     targetPort: 9000
+#     protocol: TCP
+#   sessionAffinity: None
