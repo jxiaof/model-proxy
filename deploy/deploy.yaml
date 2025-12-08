@@ -1,3 +1,65 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tencent-registry-secret
+  namespace: default
+type: kubernetes.io/dockerconfigjson
+stringData:
+  .dockerconfigjson: |
+    {
+      "auths": {
+        "default-artifact.tencentcloudcr.com": {
+          "username": "tcr$tenyunw",
+          "password": "RSw2KCGXdOh00S43KozQTwEr9Kp2BrJu",
+          "email": "your-email@example.com",
+          "auth": "dGNyJHRlbnl1bnc6UlN3MktDR1hkT2gwMFM0M0tvelFUd0VyOUtwMkJySnU="
+        }
+      }
+    }
+
+---
+
+# 模型配置 ConfigMap - 全局变量
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-config
+  namespace: default
+data:
+  # 模型基础信息
+  MODEL_NAME: "Qwen3-0.6B"
+  MODEL_PATH: "/mnt/data/tenant-320811435666051072/uploads/Qwen3-0.6B"
+  
+  # 服务配置
+  SERVICE_NAME: "sglang-proxy-service"
+  PUBLIC_SERVER_HOST: "112.90.156.84"
+  PUBLIC_SERVER_PORT: "30043"
+  
+  # Think 模式配置
+  DEFAULT_THINK_MODE: "false"
+  THINK_MODE_TIMEOUT: "600"
+  NORMAL_MODE_TIMEOUT: "300"
+
+
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen3-0.6b-v2
+  labels:
+    app: model
+    version: v2
+    environment: production
+data:
+  service_name: $(SERVICE_NAME)
+  public_server_host: $(PUBLIC_SERVER_HOST)
+  public_server_port: $(PUBLIC_SERVER_PORT)
+  params: "false"
+  thinking: "false"
+
+---
+
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -5,7 +67,7 @@ metadata:
   labels:
     app: sglang-proxy
 spec:
-  replicas: 6
+  replicas: 1
   selector:
     matchLabels:
       app: sglang-proxy
@@ -13,32 +75,12 @@ spec:
     metadata:
       labels:
         app: sglang-proxy
+        type: llm
+        model: qwen3-0.6b
+        version: v1.0
+        params: "false"
+        thinking: "false"
     spec:
-      # affinity:
-      #   # Pod 反亲和性 - 尽量分散到不同节点
-      #   podAntiAffinity:
-      #     preferredDuringSchedulingIgnoredDuringExecution:
-      #     - weight: 100
-      #       podAffinityTerm:
-      #         labelSelector:
-      #           matchLabels:
-      #             app: sglang-proxy
-      #         topologyKey: kubernetes.io/hostname
-      #   # 节点亲和性 - 只调度到有 GPU 的节点
-      #   nodeAffinity:
-      #     requiredDuringSchedulingIgnoredDuringExecution:
-      #       nodeSelectorTerms:
-      #       - matchExpressions:
-      #         - key: kubernetes.io/hostname
-      #           operator: In
-      #           values:
-      #           - sz-inf-5090-06
-      #           - sz-inf-5090-09
-      #           - sz-inf-5090-11
-      #           - sz-inf-5090-05  # GPU 有问题，暂时排除
-      nodeSelector:
-        nvidia.com/gpu.present: "true"
-        # sz-inf-5090-11
       imagePullSecrets:
       - name: tencent-registry-secret
       volumes:
@@ -58,11 +100,22 @@ spec:
           - -m
           - sglang.launch_server
         args:
-          - --model-path=/mnt/data/models/Qwen3-8B
+          - --model-path=$(MODEL_PATH)
           - --host=0.0.0.0
           - --port=30000
-          - --tokenizer-path=/mnt/data/models/Qwen3-8B
+          - --tokenizer-path=$(MODEL_PATH)
           - --log-level=warning
+        env:
+        - name: MODEL_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: model-config
+              key: MODEL_PATH
+        - name: MODEL_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: model-config
+              key: MODEL_NAME
         ports:
         - containerPort: 30000
           name: sglang
@@ -118,13 +171,37 @@ spec:
             fieldRef:
               fieldPath: metadata.namespace
         - name: SERVICE_NAME
-          value: "sglang-proxy-service"
+          valueFrom:
+            configMapKeyRef:
+              name: model-config
+              key: SERVICE_NAME
+        - name: MODEL_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: model-config
+              key: MODEL_NAME
         - name: SGLANG_URL
           value: "http://localhost:30000"
         - name: MYSQL_DSN
           value: "root:Admin@798!@tcp(gz-cdb-ihelunwl.sql.tencentcdb.com:28531)/tycloud?charset=utf8mb4&parseTime=True&loc=Local"
         - name: PORT
           value: "9000"
+        # Think 模式配置 - 从 ConfigMap 读取
+        - name: DEFAULT_THINK_MODE
+          valueFrom:
+            configMapKeyRef:
+              name: model-config
+              key: DEFAULT_THINK_MODE
+        - name: THINK_MODE_TIMEOUT
+          valueFrom:
+            configMapKeyRef:
+              name: model-config
+              key: THINK_MODE_TIMEOUT
+        - name: NORMAL_MODE_TIMEOUT
+          valueFrom:
+            configMapKeyRef:
+              name: model-config
+              key: NORMAL_MODE_TIMEOUT
         resources:
           requests:
             memory: "256Mi"
@@ -144,21 +221,75 @@ spec:
             port: 9000
           initialDelaySeconds: 10
           periodSeconds: 10
-# ---
 
-# apiVersion: v1
-# kind: Service
-# metadata:
-#   name: sglang-proxy-service
-#   labels:
-#     app: sglang-proxy
-# spec:
-#   type: LoadBalancer
-#   selector:
-#     app: sglang-proxy
-#   ports:
-#   - name: http
-#     port: 80
-#     targetPort: 9000
-#     protocol: TCP
-#   sessionAffinity: None
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-proxy-service
+  labels:
+    app: sglang-proxy
+spec:
+  type: NodePort
+  selector:
+    app: sglang-proxy
+  ports:
+  - name: http
+    port: 80
+    targetPort: 9000
+    protocol: TCP
+    nodePort: 30090
+  sessionAffinity: None
+
+---
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-model-pv
+spec:
+  capacity:
+    storage: 1Ti
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nfs-manual
+  mountOptions:
+    - vers=3
+    - nconnect=8
+    - sync
+    - tcp
+    - timeo=20
+    - retrans=3
+  nfs:
+    path: /felix-test
+    server: 10.4.0.1
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-model-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: nfs-manual
+  resources:
+    requests:
+      storage: 1Ti
+
+# 修改模型配置
+# kubectl edit configmap model-config
+
+# 或者直接修改 deploy.yaml 中的 ConfigMap 然后重新应用
+# kubectl apply -f deploy/deploy.yaml
+
+# 重启 Deployment 使配置生效
+# kubectl rollout restart deployment sglang-proxy
+
+
+# fio --name=write_throughput_test --directory=/mnt/models --ioengine=libaio --direct=1 --bs=4M  --size=10G --numjobs=16 --iodepth=64 --rw=write --group_reporting --time_based --runtime=60
+# fio --name=read_throughput_test  --directory=/mnt/models  --ioengine=libaio  --direct=1  --bs=4M --size=10G --numjobs=16  --iodepth=64 --rw=read  --group_reporting --time_based --runtime=60 
