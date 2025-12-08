@@ -7,3 +7,7 @@ node_modules/
 **/*.go.sum
 **/*.go.mod
 **/vendor/
+*.yaml
+*Dockerfile
+*dockerfile
+*.readme.md

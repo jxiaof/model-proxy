@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -18,15 +17,12 @@ import (
 )
 
 type ProxyServer struct {
-	db                *sql.DB
-	podName           string
-	namespace         string
-	serviceName       string
-	sglangURL         string
-	httpClient        *http.Client
-	defaultThinkMode  bool // 默认是否启用 Think 模式
-	thinkModeTimeout  int  // Think 模式超时时间（秒）
-	normalModeTimeout int  // 普通模式超时时间（秒）
+	db          *sql.DB
+	podName     string
+	namespace   string
+	serviceName string
+	sglangURL   string
+	httpClient  *http.Client
 }
 
 type RequestLog struct {
@@ -63,27 +59,7 @@ func NewProxyServer() (*ProxyServer, error) {
 	}
 
 	if sglangURL == "" {
-		sglangURL = "http://10.10.0.14:30821" // 默认 SGlang 端口
-	}
-
-	// Think 模式配置
-	defaultThinkMode := false
-	if v := os.Getenv("DEFAULT_THINK_MODE"); v != "" {
-		defaultThinkMode, _ = strconv.ParseBool(v)
-	}
-
-	thinkModeTimeout := 600 // 默认 10 分钟
-	if v := os.Getenv("THINK_MODE_TIMEOUT"); v != "" {
-		if t, err := strconv.Atoi(v); err == nil && t > 0 {
-			thinkModeTimeout = t
-		}
-	}
-
-	normalModeTimeout := 300 // 默认 5 分钟
-	if v := os.Getenv("NORMAL_MODE_TIMEOUT"); v != "" {
-		if t, err := strconv.Atoi(v); err == nil && t > 0 {
-			normalModeTimeout = t
-		}
+		sglangURL = "http://localhost:30000" // 默认 SGlang 端口
 	}
 
 	// 连接 MySQL
@@ -119,30 +95,24 @@ func NewProxyServer() (*ProxyServer, error) {
 
 	// 配置 HTTP 客户端支持长连接和 Think 模式的超长等待
 	httpClient := &http.Client{
-		Timeout: time.Duration(thinkModeTimeout) * time.Second,
+		Timeout: 600 * time.Second, // 10分钟超时，适合 Think 模式
 		Transport: &http.Transport{
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   100,
 			IdleConnTimeout:       120 * time.Second,
 			DisableKeepAlives:     false,
-			ResponseHeaderTimeout: time.Duration(thinkModeTimeout) * time.Second,
+			ResponseHeaderTimeout: 300 * time.Second, // Think 模式可能需要更长的首字节等待
 			ExpectContinueTimeout: 10 * time.Second,
 		},
 	}
 
-	log.Printf("Think mode config: default=%v, think_timeout=%ds, normal_timeout=%ds",
-		defaultThinkMode, thinkModeTimeout, normalModeTimeout)
-
 	return &ProxyServer{
-		db:                db,
-		podName:           podName,
-		namespace:         namespace,
-		serviceName:       serviceName,
-		sglangURL:         sglangURL,
-		httpClient:        httpClient,
-		defaultThinkMode:  defaultThinkMode,
-		thinkModeTimeout:  thinkModeTimeout,
-		normalModeTimeout: normalModeTimeout,
+		db:          db,
+		podName:     podName,
+		namespace:   namespace,
+		serviceName: serviceName,
+		sglangURL:   sglangURL,
+		httpClient:  httpClient,
 	}, nil
 }
 
@@ -190,125 +160,48 @@ func (ps *ProxyServer) logRequest(ctx context.Context, path, method string, stat
 	return err
 }
 
-// ThinkModeResult 表示 Think 模式检测结果
-type ThinkModeResult struct {
-	Enabled       bool   // 是否启用 Think 模式
-	Source        string // 来源: "default", "query", "header", "body"
-	ExplicitlySet bool   // 是否显式设置（非默认值）
-}
-
-// 检测是否为 Think 模式请求 - 支持多种方式控制
-func (ps *ProxyServer) detectThinkMode(r *http.Request, body []byte) ThinkModeResult {
-	result := ThinkModeResult{
-		Enabled:       ps.defaultThinkMode,
-		Source:        "default",
-		ExplicitlySet: false,
-	}
-
-	// 1. 优先级最高：URL 查询参数 ?thinking=true/false
-	if v := r.URL.Query().Get("thinking"); v != "" {
-		if parsed, err := strconv.ParseBool(v); err == nil {
-			result.Enabled = parsed
-			result.Source = "query"
-			result.ExplicitlySet = true
-			return result
-		}
-	}
-
-	// 2. 优先级次之：HTTP Header X-Think-Mode: true/false
-	if v := r.Header.Get("X-Think-Mode"); v != "" {
-		if parsed, err := strconv.ParseBool(v); err == nil {
-			result.Enabled = parsed
-			result.Source = "header"
-			result.ExplicitlySet = true
-			return result
-		}
-	}
-
-	// 3. 检查请求体中的参数
-	if len(body) > 0 {
-		bodyResult := ps.detectThinkModeFromBody(body)
-		if bodyResult.ExplicitlySet {
-			return bodyResult
-		}
-	}
-
-	return result
-}
-
-// 从请求体检测 Think 模式
-func (ps *ProxyServer) detectThinkModeFromBody(body []byte) ThinkModeResult {
-	result := ThinkModeResult{
-		Enabled:       ps.defaultThinkMode,
-		Source:        "default",
-		ExplicitlySet: false,
-	}
-
+// 检测是否为 Think 模式请求
+func isThinkModeRequest(body []byte) bool {
+	// 检测请求体中是否包含 Think 模式相关参数
 	var reqBody map[string]interface{}
 	if err := json.Unmarshal(body, &reqBody); err != nil {
-		return result
+		return false
 	}
 
-	// 检查 thinking 参数 (bool)
-	if thinking, ok := reqBody["thinking"].(bool); ok {
-		result.Enabled = thinking
-		result.Source = "body:thinking"
-		result.ExplicitlySet = true
-		return result
+	// 检查常见的 Think 模式标志
+	// 1. thinking 参数
+	if thinking, ok := reqBody["thinking"].(bool); ok && thinking {
+		return true
 	}
 
-	// 检查 enable_thinking 参数 (bool)
-	if enableThinking, ok := reqBody["enable_thinking"].(bool); ok {
-		result.Enabled = enableThinking
-		result.Source = "body:enable_thinking"
-		result.ExplicitlySet = true
-		return result
+	// 2. enable_thinking 参数
+	if enableThinking, ok := reqBody["enable_thinking"].(bool); ok && enableThinking {
+		return true
 	}
 
-	// 检查 chat_template_kwargs.enable_thinking 参数（Qwen3 格式）
-	if kwargs, ok := reqBody["chat_template_kwargs"].(map[string]interface{}); ok {
-		if enableThinking, ok := kwargs["enable_thinking"].(bool); ok {
-			result.Enabled = enableThinking
-			result.Source = "body:chat_template_kwargs.enable_thinking"
-			result.ExplicitlySet = true
-			return result
-		}
-	}
-
-	// 检查 sampling_params 中的 thinking 参数
-	if samplingParams, ok := reqBody["sampling_params"].(map[string]interface{}); ok {
-		if thinking, ok := samplingParams["thinking"].(bool); ok {
-			result.Enabled = thinking
-			result.Source = "body:sampling_params.thinking"
-			result.ExplicitlySet = true
-			return result
-		}
-	}
-
-	// 检查 messages 中是否有 think 指令（隐式检测，仅当默认开启时生效）
-	if ps.defaultThinkMode {
-		if messages, ok := reqBody["messages"].([]interface{}); ok {
-			for _, msg := range messages {
-				if m, ok := msg.(map[string]interface{}); ok {
-					if content, ok := m["content"].(string); ok {
-						lowerContent := strings.ToLower(content)
-						if strings.Contains(lowerContent, "/think") ||
-							strings.Contains(lowerContent, "think step by step") ||
-							strings.Contains(lowerContent, "let's think") ||
-							strings.Contains(lowerContent, "请一步一步思考") ||
-							strings.Contains(lowerContent, "让我们思考") {
-							result.Enabled = true
-							result.Source = "body:messages_hint"
-							result.ExplicitlySet = false // 隐式检测
-							return result
-						}
+	// 3. 检查 messages 中是否有 think 指令
+	if messages, ok := reqBody["messages"].([]interface{}); ok {
+		for _, msg := range messages {
+			if m, ok := msg.(map[string]interface{}); ok {
+				if content, ok := m["content"].(string); ok {
+					if strings.Contains(strings.ToLower(content), "/think") ||
+						strings.Contains(strings.ToLower(content), "think step by step") ||
+						strings.Contains(strings.ToLower(content), "let's think") {
+						return true
 					}
 				}
 			}
 		}
 	}
 
-	return result
+	// 4. 检查 sampling_params 中的 thinking 参数
+	if samplingParams, ok := reqBody["sampling_params"].(map[string]interface{}); ok {
+		if thinking, ok := samplingParams["thinking"].(bool); ok && thinking {
+			return true
+		}
+	}
+
+	return false
 }
 
 // 检测响应是否包含 Think 内容
@@ -326,98 +219,15 @@ func enableCORS(w http.ResponseWriter, r *http.Request) bool {
 		origin = "*"
 	}
 
-	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
-	w.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Tenant-ID, Accept-Language, X-Request-ID, X-Internal-Timestamp, X-Internal-Signature, X-Internal-Nonce, X-Internal-Call, X-Think-Mode")
+	w.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Tenant-ID, Accept-Language, X-Request-ID, X-Internal-Timestamp, X-Internal-Signature, X-Internal-Nonce, X-Internal-Call")
 	w.Header().Set("Access-Control-Allow-Credentials", "true")
 	w.Header().Set("Access-Control-Max-Age", "86400")
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return true
-	}
-	return false
-}
-
-// 转换请求体，将 thinking 参数转换为 SGLang 需要的格式
-func (ps *ProxyServer) transformRequestBody(body []byte, thinkResult ThinkModeResult) ([]byte, error) {
-	if len(body) == 0 {
-		return body, nil
-	}
-
-	var reqBody map[string]interface{}
-	if err := json.Unmarshal(body, &reqBody); err != nil {
-		return body, nil
-	}
-
-	modified := false
-
-	// 删除代理层面的 thinking 参数（SGLang 不识别这些参数）
-	if _, ok := reqBody["thinking"]; ok {
-		delete(reqBody, "thinking")
-		modified = true
-	}
-	if _, ok := reqBody["enable_thinking"]; ok {
-		delete(reqBody, "enable_thinking")
-		modified = true
-	}
-
-	// 获取或创建 chat_template_kwargs
-	kwargs, ok := reqBody["chat_template_kwargs"].(map[string]interface{})
-	if !ok {
-		kwargs = make(map[string]interface{})
-	}
-
-	// 检查当前 kwargs 中的 enable_thinking 值
-	currentEnabled, hasCurrentEnabled := kwargs["enable_thinking"].(bool)
-
-	// 决定是否需要设置 enable_thinking
-	needsUpdate := false
-	targetEnabled := thinkResult.Enabled
-
-	if thinkResult.ExplicitlySet {
-		// 用户显式设置了，使用用户的值
-		if !hasCurrentEnabled || currentEnabled != targetEnabled {
-			needsUpdate = true
-		}
-	} else if !hasCurrentEnabled {
-		// 用户没有显式设置，且 kwargs 中也没有，使用默认值
-		targetEnabled = ps.defaultThinkMode
-		needsUpdate = true
-	}
-
-	if needsUpdate {
-		kwargs["enable_thinking"] = targetEnabled
-		reqBody["chat_template_kwargs"] = kwargs
-		modified = true
-		log.Printf("Setting enable_thinking=%v in chat_template_kwargs", targetEnabled)
-	}
-
-	if !modified {
-		return body, nil
-	}
-
-	newBody, err := json.Marshal(reqBody)
-	if err != nil {
-		log.Printf("Error marshaling transformed body: %v", err)
-		return body, err
-	}
-
-	log.Printf("Transformed request: %s", string(newBody))
-	return newBody, nil
-}
-
-// 检测请求是否要求流式响应
-func isStreamRequest(body []byte) bool {
-	if len(body) == 0 {
-		return false
-	}
-	var reqBody map[string]interface{}
-	if err := json.Unmarshal(body, &reqBody); err != nil {
-		return false
-	}
-	if stream, ok := reqBody["stream"].(bool); ok {
-		return stream
 	}
 	return false
 }
@@ -431,14 +241,10 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	startTime := time.Now()
 
-	// 构建目标 URL（移除代理自用的查询参数）
+	// 构建目标 URL
 	targetURL := ps.sglangURL + r.URL.Path
-
-	// 过滤掉代理自用的查询参数
-	query := r.URL.Query()
-	query.Del("thinking") // 移除代理层面的 thinking 参数
-	if len(query) > 0 {
-		targetURL += "?" + query.Encode()
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
 	}
 
 	// 读取请求体
@@ -448,36 +254,23 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		r.Body.Close()
 	}
 
-	// 检测是否为流式请求（根据请求体中的 stream 参数）
-	requestedStream := isStreamRequest(bodyBytes)
-
-	// 检测 Think 模式
-	thinkResult := ps.detectThinkMode(r, bodyBytes)
-	isThinkMode := thinkResult.Enabled
-
-	// 转换请求体为 SGLang 格式
-	transformedBody, err := ps.transformRequestBody(bodyBytes, thinkResult)
-	if err != nil {
-		log.Printf("Error transforming request body: %v", err)
-		transformedBody = bodyBytes
-	}
-
-	if thinkResult.ExplicitlySet || thinkResult.Source != "default" {
-		log.Printf("Think mode: enabled=%v, source=%s, stream=%v, request=%s %s",
-			isThinkMode, thinkResult.Source, requestedStream, r.Method, r.URL.Path)
+	// 检测是否为 Think 模式
+	isThinkMode := isThinkModeRequest(bodyBytes)
+	if isThinkMode {
+		log.Printf("Think mode detected for request: %s %s", r.Method, r.URL.Path)
 	}
 
 	// 创建新请求 - Think 模式使用更长的超时上下文
 	var ctx context.Context
 	var cancel context.CancelFunc
 	if isThinkMode {
-		ctx, cancel = context.WithTimeout(r.Context(), time.Duration(ps.thinkModeTimeout)*time.Second)
+		ctx, cancel = context.WithTimeout(r.Context(), 600*time.Second) // 10分钟
 	} else {
-		ctx, cancel = context.WithTimeout(r.Context(), time.Duration(ps.normalModeTimeout)*time.Second)
+		ctx, cancel = context.WithTimeout(r.Context(), 300*time.Second) // 5分钟
 	}
 	defer cancel()
 
-	proxyReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(transformedBody))
+	proxyReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		log.Printf("Error creating proxy request: %v", err)
 		http.Error(w, "Proxy error", http.StatusInternalServerError)
@@ -487,18 +280,9 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 复制请求头
 	for key, values := range r.Header {
-		// 跳过代理自用的头
-		if key == "X-Think-Mode" {
-			continue
-		}
 		for _, value := range values {
 			proxyReq.Header.Add(key, value)
 		}
-	}
-
-	// 更新 Content-Length（如果请求体被修改）
-	if len(transformedBody) != len(bodyBytes) {
-		proxyReq.Header.Set("Content-Length", strconv.Itoa(len(transformedBody)))
 	}
 
 	// 发送请求
@@ -511,20 +295,16 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// 检测响应是否为流式（SSE）- 综合判断
-	contentType := resp.Header.Get("Content-Type")
-	isStreamResponse := requestedStream || // 请求中指定了 stream=true
-		strings.Contains(contentType, "text/event-stream") ||
-		strings.Contains(contentType, "application/x-ndjson") ||
-		strings.Contains(contentType, "application/stream") ||
+	// 检测响应是否为流式（SSE）
+	isStreamResponse := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") ||
+		strings.Contains(resp.Header.Get("Content-Type"), "application/x-ndjson") ||
 		resp.Header.Get("Transfer-Encoding") == "chunked"
 
-	// 复制响应头（排除可能冲突的头）
+	// 复制响应头（排除可能冲突的 CORS 头）
 	for key, values := range resp.Header {
 		if key == "Access-Control-Allow-Origin" ||
 			key == "Access-Control-Allow-Methods" ||
-			key == "Access-Control-Allow-Headers" ||
-			(isStreamResponse && key == "Content-Length") { // 流式响应不传递 Content-Length
+			key == "Access-Control-Allow-Headers" {
 			continue
 		}
 		for _, value := range values {
@@ -532,42 +312,31 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 添加 Think 模式响应头
-	w.Header().Set("X-Think-Mode-Enabled", strconv.FormatBool(isThinkMode))
-	w.Header().Set("X-Think-Mode-Source", thinkResult.Source)
-
-	// 对于流式响应，确保禁用所有缓冲
+	// 对于流式响应，确保禁用缓冲
 	if isStreamResponse {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("X-Accel-Buffering", "no")
-		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Del("Content-Length") // 确保删除 Content-Length
+		w.Header().Set("Cache-Control", "no-cache")
+		// w.Header().Set("Connection", "keep-alive")
 	}
 
 	// 设置状态码
 	w.WriteHeader(resp.StatusCode)
 
-	// 流式复制响应体
+	// 流式复制响应体 - 支持 SSE 和 Think 模式
 	var detectedThinkInResponse bool
-	flusher, canFlush := w.(http.Flusher)
-
-	if isStreamResponse && canFlush {
-		// 流式传输：使用小缓冲区，立即刷新
-		buffer := make([]byte, 256) // 小缓冲区减少延迟
+	if flusher, ok := w.(http.Flusher); ok {
+		buffer := make([]byte, 4096)
 		for {
 			n, readErr := resp.Body.Read(buffer)
 			if n > 0 {
 				// 检测响应中是否包含 Think 内容
 				if !detectedThinkInResponse && containsThinkContent(buffer[:n]) {
 					detectedThinkInResponse = true
-					if !isThinkMode {
-						isThinkMode = true
-					}
+					isThinkMode = true // 更新为 Think 模式
 				}
 
 				if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
-					log.Printf("Error writing stream response: %v", writeErr)
+					log.Printf("Error writing response: %v", writeErr)
 					break
 				}
 				flusher.Flush() // 立即刷新数据到客户端
@@ -576,39 +345,12 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			if readErr != nil {
-				log.Printf("Error reading stream response: %v", readErr)
-				break
-			}
-		}
-	} else if canFlush {
-		// 非流式但支持 flush：使用较大缓冲区
-		buffer := make([]byte, 4096)
-		for {
-			n, readErr := resp.Body.Read(buffer)
-			if n > 0 {
-				if !detectedThinkInResponse && containsThinkContent(buffer[:n]) {
-					detectedThinkInResponse = true
-					if !isThinkMode {
-						isThinkMode = true
-					}
-				}
-
-				if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
-					log.Printf("Error writing response: %v", writeErr)
-					break
-				}
-				flusher.Flush()
-			}
-			if readErr == io.EOF {
-				break
-			}
-			if readErr != nil {
-				log.Printf("Error reading response: %v", readErr)
+				log.Printf("Error reading response body: %v", readErr)
 				break
 			}
 		}
 	} else {
-		// 不支持 flush：一次性复制
+		// 普通传输
 		io.Copy(w, resp.Body)
 	}
 
@@ -619,14 +361,10 @@ func (ps *ProxyServer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	modeStr := ""
 	if isThinkMode {
-		modeStr = fmt.Sprintf(" [THINK:%s]", thinkResult.Source)
+		modeStr = " [THINK]"
 	}
-	streamStr := ""
-	if isStreamResponse {
-		streamStr = " [STREAM]"
-	}
-	log.Printf("Request proxied%s%s: %s %s -> Pod: %s, Status: %d, Duration: %v",
-		modeStr, streamStr, r.Method, r.URL.Path, ps.podName, resp.StatusCode, duration)
+	log.Printf("Request proxied%s: %s %s -> Pod: %s, Status: %d, Duration: %v",
+		modeStr, r.Method, r.URL.Path, ps.podName, resp.StatusCode, duration)
 }
 
 // 健康检查
@@ -641,11 +379,6 @@ func (ps *ProxyServer) healthHandler(w http.ResponseWriter, r *http.Request) {
 		"namespace": ps.namespace,
 		"service":   ps.serviceName,
 		"features":  []string{"streaming", "think-mode", "cors"},
-		"config": map[string]interface{}{
-			"default_think_mode":  ps.defaultThinkMode,
-			"think_mode_timeout":  ps.thinkModeTimeout,
-			"normal_mode_timeout": ps.normalModeTimeout,
-		},
 		"timestamp": time.Now().Format(time.RFC3339),
 	})
 }
@@ -889,13 +622,8 @@ func (ps *ProxyServer) thinkStatsHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	successResponse(w, map[string]interface{}{
-		"service":   service,
-		"namespace": ps.namespace,
-		"config": map[string]interface{}{
-			"default_think_mode":  ps.defaultThinkMode,
-			"think_mode_timeout":  ps.thinkModeTimeout,
-			"normal_mode_timeout": ps.normalModeTimeout,
-		},
+		"service":    service,
+		"namespace":  ps.namespace,
 		"mode_stats": modeStats,
 		"timestamp":  time.Now().Format(time.RFC3339),
 	})
@@ -933,10 +661,7 @@ func main() {
 	}
 
 	log.Printf("Starting proxy server on port %s (Pod: %s) with CORS and Think mode enabled", port, proxy.podName)
-	log.Printf("Think mode: default=%v, think_timeout=%ds, normal_timeout=%ds",
-		proxy.defaultThinkMode, proxy.thinkModeTimeout, proxy.normalModeTimeout)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
-
 }

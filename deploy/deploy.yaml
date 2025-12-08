@@ -23,8 +23,12 @@ stringData:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: model-config
+  name: qwen3-0.6b
   namespace: default
+  labels:
+    app: model
+    version: v2
+    environment: production
 data:
   # 模型基础信息
   MODEL_NAME: "Qwen3-0.6B"
@@ -39,24 +43,6 @@ data:
   DEFAULT_THINK_MODE: "false"
   THINK_MODE_TIMEOUT: "600"
   NORMAL_MODE_TIMEOUT: "300"
-
-
----
-
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: qwen3-0.6b-v2
-  labels:
-    app: model
-    version: v2
-    environment: production
-data:
-  service_name: $(SERVICE_NAME)
-  public_server_host: $(PUBLIC_SERVER_HOST)
-  public_server_port: $(PUBLIC_SERVER_PORT)
-  params: "false"
-  thinking: "false"
 
 ---
 
@@ -109,12 +95,12 @@ spec:
         - name: MODEL_PATH
           valueFrom:
             configMapKeyRef:
-              name: model-config
+              name: qwen3-0.6b
               key: MODEL_PATH
         - name: MODEL_NAME
           valueFrom:
             configMapKeyRef:
-              name: model-config
+              name: qwen3-0.6b
               key: MODEL_NAME
         ports:
         - containerPort: 30000
@@ -173,12 +159,12 @@ spec:
         - name: SERVICE_NAME
           valueFrom:
             configMapKeyRef:
-              name: model-config
+              name: qwen3-0.6b
               key: SERVICE_NAME
         - name: MODEL_NAME
           valueFrom:
             configMapKeyRef:
-              name: model-config
+              name: qwen3-0.6b
               key: MODEL_NAME
         - name: SGLANG_URL
           value: "http://localhost:30000"
@@ -190,17 +176,17 @@ spec:
         - name: DEFAULT_THINK_MODE
           valueFrom:
             configMapKeyRef:
-              name: model-config
+              name: qwen3-0.6b
               key: DEFAULT_THINK_MODE
         - name: THINK_MODE_TIMEOUT
           valueFrom:
             configMapKeyRef:
-              name: model-config
+              name: qwen3-0.6b
               key: THINK_MODE_TIMEOUT
         - name: NORMAL_MODE_TIMEOUT
           valueFrom:
             configMapKeyRef:
-              name: model-config
+              name: qwen3-0.6b
               key: NORMAL_MODE_TIMEOUT
         resources:
           requests:
@@ -282,7 +268,7 @@ spec:
       storage: 1Ti
 
 # 修改模型配置
-# kubectl edit configmap model-config
+# kubectl edit configmap qwen3-0.6b
 
 # 或者直接修改 deploy.yaml 中的 ConfigMap 然后重新应用
 # kubectl apply -f deploy/deploy.yaml
